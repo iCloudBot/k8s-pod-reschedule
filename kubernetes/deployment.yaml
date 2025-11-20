@@ -1,0 +1,201 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-pod-rescheduler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-pod-rescheduler
+rules:
+# Pod 基本操作：监控 & 删除异常 Pod
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+# 节点：读取状态 + cordon/taint 需要的 patch/update
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+# 读取控制器（用于查找 Pod 的 owner）
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "replicasets"]
+  verbs: ["get", "list", "watch"]
+# 通过 scale 子资源重启（你代码里就是这么做的）
+- apiGroups: ["apps"]
+  resources: ["deployments/scale", "statefulsets/scale", "replicasets/scale"]
+  verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-pod-rescheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-pod-rescheduler
+subjects:
+- kind: ServiceAccount
+  name: kube-pod-rescheduler
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-pod-rescheduler-script
+  namespace: kube-system
+data:
+  rescheduler.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "Starting pod rescheduler..."
+    echo "Current time: $(date)"
+
+    # 使用 ServiceAccount 生成 kubeconfig 并导出到 /kube/config
+    SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+    TOKEN="$(cat ${SA_DIR}/token)"
+    CA="${SA_DIR}/ca.crt"
+    CLUSTER_URL="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+
+    mkdir -p /kube
+
+    cat > /kube/config <<EOF
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - name: incluster
+      cluster:
+        certificate-authority: ${CA}
+        server: ${CLUSTER_URL}
+    contexts:
+    - name: incluster
+      context:
+        cluster: incluster
+        user: sa
+    current-context: incluster
+    users:
+    - name: sa
+      user:
+        token: ${TOKEN}
+    EOF
+
+    echo "Checking kubectl connectivity..."
+    kubectl --request-timeout=10s get --raw=/livez >/dev/null
+    kubectl --request-timeout=10s get nodes >/dev/null
+
+    echo "All checks passed, starting pod-reschedule..."
+    exec pod-reschedule
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-pod-rescheduler
+  namespace: kube-system
+spec:
+  replicas: 1   # 一般只需要 1 个副本，避免多实例同时操作同一批 Pod
+  selector:
+    matchLabels:
+      app: kube-pod-rescheduler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: kube-pod-rescheduler
+    spec:
+      serviceAccountName: kube-pod-rescheduler
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      restartPolicy: Always
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: kube-pod-rescheduler
+                topologyKey: kubernetes.io/hostname
+              weight: 100
+      containers:
+        - name: kube-pod-rescheduler
+          image: cleverest/pod-rescheduler:latest
+          imagePullPolicy: Always # IfNotPresent
+          command: ["/bin/sh", "/scripts/rescheduler.sh"]
+          env:
+            - name: TZ
+              value: "Asia/Shanghai"
+            - name: KUBERNETES_SERVICE_HOST
+              value: "kubernetes.default.svc"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "443"
+            - name: KUBECONFIG
+              value: "/kube/config"
+            - name: CHECK_INTERVAL            # 检查间隔（秒）
+              value: "90"
+            - name: POD_ABNORMAL_THRESHOLD    # Pod 异常阈值（秒）
+              value: "300"
+            - name: LOG_DIR                   # 日志目录
+              value: "/logs"
+            - name: NAMESPACES                # 监控命名空间（为空则监控所有命名空间，逗号分隔）
+              value: ""
+            - name: EXCLUDE_NAMESPACES        # 排除监控命名空间（逗号分隔）
+              value: "kube-system,kube-public,kube-node-lease"
+            - name: SCALE_WAIT_SECONDS        # Scale 操作等待时间（秒）
+              value: "5"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -f pod-reschedule >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -f pod-reschedule >/dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            # - name: kubeconf
+            #   mountPath: /root/.kube
+            - name: script-volume
+              mountPath: /scripts
+            # - name: log-volume
+            #   mountPath: /logs
+            #   subPath: kube-pod-rescheduler
+      volumes:
+        # - name: kubeconf
+        #   emptyDir: {}
+        - name: script-volume
+          configMap:
+            name: kube-pod-rescheduler-script
+            defaultMode: 0755
+        # - name: log-volume
+        #   persistentVolumeClaim:
+        #     claimName: kube-pod-rescheduler-pvc
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 60
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 60

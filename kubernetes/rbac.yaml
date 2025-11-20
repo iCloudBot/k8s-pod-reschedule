@@ -1,0 +1,41 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-pod-rescheduler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-pod-rescheduler
+rules:
+# Pod 基本操作：监控 & 删除异常 Pod
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+# 节点：读取状态 + cordon/taint 需要的 patch/update
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+# 读取控制器（用于查找 Pod 的 owner）
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "replicasets"]
+  verbs: ["get", "list", "watch"]
+# 通过 scale 子资源重启（你代码里就是这么做的）
+- apiGroups: ["apps"]
+  resources: ["deployments/scale", "statefulsets/scale", "replicasets/scale"]
+  verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-pod-rescheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-pod-rescheduler
+subjects:
+- kind: ServiceAccount
+  name: kube-pod-rescheduler
+  namespace: kube-system
